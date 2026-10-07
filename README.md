@@ -19,6 +19,7 @@ Target: Qwen3-235B-A22B. Development model: Qwen3-30B-A3B (same architecture).
 | `tools/logits/` | `fm-logits`: dump logits to compare stock vs streamed runs |
 | `runtime/` | `estore` (udmabuf pools, io_uring O_DIRECT scatter reads, LRU, prefetch) and `fm-replay` |
 | `patches/llama.cpp-estore.patch` | llama.cpp integration (`FM_ESTORE_PACK=model.pack`) |
+| `scripts/` | phone and host helpers for the Fold runs (server, A/B, quality, energy, thermal); see scripts/README.md |
 | `phase0/` | on-phone kit: `guard.sh` (battery/SoC temperature stop), `sysinfo.sh`, `fio-experts.sh`, `bench-baseline.sh` |
 | `docs/` | [plan.md](docs/plan.md), [runtime.md](docs/runtime.md), [results.md](docs/results.md) |
 | `models/`, `data/`, `traces/`, `third_party/` | downloads, outputs, llama.cpp clone (git-ignored) |

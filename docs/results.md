@@ -845,7 +845,7 @@ After the buffer fix, with the GPU backend loaded but no split, decode matches C
 32 tokens), and the split config with a 16-token prompt (below the 32-token threshold) decodes in 48.27 s
 (0.66 tok/s). The ~6 s slower decode after a split 128-token prompt is heat: the CPU+GPU prompt leaves the
 big cluster at ~87 C, near the 90 C CPU trip, as decode starts. Net for chat it is still a clear gain (~33 s
-saved per 128 prompt tokens). Server config: `serve-best.sh` / `serve-best-run.sh` on the phone (gamma 1,
+saved per 128 prompt tokens). Server config: `scripts/phone/serve.sh` / `scripts/phone/serve-run.sh` (gamma 1,
 TPU prefetch, split 5 for batches >= 32, `--no-host -lm mmap`, GPU pinned 848 MHz, pause at battery 44 C or
 big cluster 85 C).
 
@@ -902,4 +902,4 @@ includes pauses. Each run started at battery <= 38 C and big <= 50 C; phone on t
 At full clocks the big cluster hits 85 C every few seconds (all pauses were SoC-triggered, 2-4 s each, many
 of them); at the lower caps it never reaches 85 C, and the lost compute speed is smaller than the pauses
 it avoids (flash stall also fell, 116 -> 93 s, with fewer pause-interrupted reads). The sustained limit is the
-SoC sensor, not battery heat per token. Server default is now these caps (serve-best-run.sh).
+SoC sensor, not battery heat per token. Server default is now these caps (scripts/phone/serve-run.sh).
