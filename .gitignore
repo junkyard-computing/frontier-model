@@ -1,0 +1,13 @@
+/models/
+/data/
+/traces/
+/build/
+/result
+__pycache__/
+/third_party/
+/build-es/
+/build-vk/
+/build-finch/
+/build-tpu/
+/.claude/
+*.log

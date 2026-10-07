@@ -1,0 +1,1481 @@
+diff --git a/ggml/include/ggml-vulkan.h b/ggml/include/ggml-vulkan.h
+index ed5ea5f79..18089a0ff 100644
+--- a/ggml/include/ggml-vulkan.h
++++ b/ggml/include/ggml-vulkan.h
+@@ -22,6 +22,10 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t d
+ // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
+ 
++// Wrap a dma-buf (fd stays owned by the caller) as a device buffer of device dev_num, zero-copy.
++// Needs VK_EXT_external_memory_dma_buf; returns NULL if the device cannot import it.
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_vk_buffer_from_dmabuf(size_t dev_num, int fd, size_t size);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
+ 
+ #ifdef  __cplusplus
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 20bf96501..a4fdf2adf 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1660,7 +1660,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        // FM_SCHED_OVERLAP (frontier-model): let a CPU split run while the previous (GPU) split is still
++        // computing. Only safe when the graph keeps every tensor the GPU split reads alive (the
++        // FM_ESTORE_SPLIT expert path marks them as outputs); splits that consume GPU results still wait
++        // on the event when copying their inputs.
++        static const bool fm_overlap = getenv("FM_SCHED_OVERLAP") != nullptr;
++        const bool overlap = fm_overlap &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
++        if (!overlap && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
+index 4d4c84951..ee5c3bfb2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
+@@ -1,5 +1,7 @@
+ #include "ggml-vulkan-common.h"
+ 
++#include <unistd.h>
++
+ ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
+     /* .get_name         = */ ggml_backend_vk_buffer_type_name,
+     /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_alloc_buffer,
+@@ -756,6 +758,97 @@ ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
+     /* .reset           = */ NULL,
+ };
+ 
++// Import a dma-buf (e.g. a udmabuf over a memfd) as a storage buffer. The memory stays shared with
++// whoever else maps the dma-buf (CPU, other devices); nothing is copied. fd stays owned by the caller.
++vk_buffer ggml_vk_buffer_from_dmabuf(vk_device & device, int fd, size_t size) {
++    if (!device->external_memory_dma_buf || size == 0 || size > device->max_buffer_size) {
++        return {};
++    }
++    const auto handle_type = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
++
++    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
++    vk::MemoryAllocateFlags mem_flags {};
++    if (device->buffer_device_address) {
++        usage_flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
++        mem_flags |= vk::MemoryAllocateFlagBits::eDeviceAddress;
++    }
++    vk::ExternalMemoryBufferCreateInfo external_memory_bci { handle_type };
++    vk::BufferCreateInfo buffer_create_info { vk::BufferCreateFlags(), size, usage_flags, vk::SharingMode::eExclusive, 0, nullptr, &external_memory_bci };
++
++    vk_buffer buf = std::make_shared<vk_buffer_struct>();
++    buf->buffer = device->device.createBuffer(buffer_create_info);
++    const vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
++
++    vk::MemoryFdPropertiesKHR fd_props;
++    try {
++        fd_props = device->device.getMemoryFdPropertiesKHR(handle_type, fd);
++    } catch (vk::SystemError & e) {
++        GGML_LOG_WARN("ggml_vulkan: getMemoryFdPropertiesKHR failed (%s)\n", e.what());
++        device->device.destroyBuffer(buf->buffer);
++        return {};
++    }
++    if (mem_req.size > size) {
++        GGML_LOG_WARN("ggml_vulkan: dma-buf of %zu bytes too small for buffer (needs %zu)\n", size, (size_t) mem_req.size);
++        device->device.destroyBuffer(buf->buffer);
++        return {};
++    }
++
++    // prefer a host-visible type so the buffer can also be mapped
++    const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
++    const uint32_t allowed = fd_props.memoryTypeBits & mem_req.memoryTypeBits;
++    uint32_t idx = 32;
++    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++        if (!(allowed & (1u << i))) {
++            continue;
++        }
++        if (idx == 32 || (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible)) {
++            idx = i;
++        }
++        if (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) {
++            break;
++        }
++    }
++    if (idx == 32) {
++        GGML_LOG_WARN("ggml_vulkan: no memory type can import this dma-buf\n");
++        device->device.destroyBuffer(buf->buffer);
++        return {};
++    }
++
++    // on success the driver owns the fd it was given, so hand it a duplicate
++    const int import_fd = dup(fd);
++    vk::MemoryAllocateFlagsInfo mem_flags_info { mem_flags };
++    vk::ImportMemoryFdInfoKHR import_info { handle_type, import_fd, &mem_flags_info };
++    try {
++        buf->device_memory = device->device.allocateMemory({ mem_req.size, idx, &import_info });
++    } catch (const vk::SystemError & e) {
++        GGML_LOG_WARN("ggml_vulkan: dma-buf import failed (%s)\n", e.what());
++        close(import_fd);
++        device->device.destroyBuffer(buf->buffer);
++        return {};
++    }
++    buf->memory_property_flags = mem_props.memoryTypes[idx].propertyFlags;
++    buf->ptr = nullptr;
++    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
++        // some drivers refuse to map imported dma-bufs; then treat the buffer as device-only
++        // (the exporter already has its own CPU mapping of these pages)
++        try {
++            buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
++        } catch (const vk::SystemError &) {
++            buf->memory_property_flags &= ~(vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent |
++                                            vk::MemoryPropertyFlagBits::eHostCached);
++        }
++    }
++    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
++    buf->device = device;
++    buf->size = size;
++    if (device->buffer_device_address) {
++        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
++        buf->bda_addr = device->device.getBufferAddress(addressInfo);
++    }
++    device->memory_logger->log_allocation(buf, size);
++    return buf;
++}
++
+ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {
+     if (!device->external_memory_host) {
+         return {};
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+index 4ae5fea7a..2dfecedb9 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+@@ -58,6 +58,7 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
+ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
+ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
+ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
++vk_buffer ggml_vk_buffer_from_dmabuf(vk_device & device, int fd, size_t size);
+ 
+ // pipelines
+ uint64_t vk_tensor_offset(const ggml_tensor * tensor);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 252359bf8..33d59c4dd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -686,6 +686,7 @@ struct vk_device_struct {
+     uint64_t suballocation_block_size;
+     uint64_t min_imported_host_pointer_alignment;
+     bool external_memory_host {};
++    bool external_memory_dma_buf {};  // VK_EXT_external_memory_dma_buf + VK_KHR_external_memory_fd
+     bool fp16;
+     bool bf16;
+     bool pipeline_robustness;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 414e14f85..7eaaa5213 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1788,19 +1788,34 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         const uint32_t itk = device->coopmat_int_k;
+ 
+         const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
++        // The small tiles are 32x32 with WN = 32, so each warp must own a 32/warps-row slice: WM = 32 / (BLOCK_SIZE / WARP).
++        // The fixed WM above is wrong on subgroup-16 devices (Mali): 2 warps share one 32x32 warp tile, the second
++        // computes past the tile in shared memory, and WNITER doubles (register spills; ~30x slow MUL_MAT_ID at
++        // batch 16 on a G710). Only subgroup-16 devices without coopmat are changed. Applied only to the MUL_MAT_ID quant tiles
++        // (mmqid*), the ones verified (test-backend-ops 90/90) and measured: on the plain matmul tiles the same change
++        // faulted the GPU (CS_BUS_FAULT) in all-on-GPU Qwen3-30B decode, so those keep upstream's WM.
++        // GGML_VK_SG16_WM_TILES: bitmask of tile families that get the fix (1 s_warptile, 2 mmq, 4 mmq_int, 8 mmq_int_k,
++        // 16 id, 32 mmqid, 64 mmqid_int, 128 mmqid_int_k); default 224 = the mmqid families. GGML_VK_SG16_WM_OLD: none.
++        const auto s_wm = [&](uint32_t block, uint32_t warp, uint32_t family) -> uint32_t {
++            static const bool old_wm = getenv("GGML_VK_SG16_WM_OLD") != nullptr;
++            static const uint32_t mask = getenv("GGML_VK_SG16_WM_TILES") ? (uint32_t) atoi(getenv("GGML_VK_SG16_WM_TILES")) : 224u;
++            if (old_wm || !(mask & family) || device->subgroup_size != 16 || device->coopmat_support || warp == 0) return s_warptile_wm;
++            const uint32_t warps = block / warp;
++            return (warps >= 1 && 32 % warps == 0) ? 32 / warps : s_warptile_wm;
++        };
+ 
+         l_warptile = { 128,             128, 128, 16, mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mm_warp_8 };
+         m_warptile = { 128,              64,  64, 16, mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
+-        s_warptile = { subgroup_size_32, 32,  32, 16, s_warptile_wm, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
++        s_warptile = { subgroup_size_32, 32,  32, 16, s_wm(subgroup_size_32, subgroup_size_8, 1), 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+ 
+         l_warptile_mmq = { 128,             128, 128, 32, mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mm_warp_8 };
+         m_warptile_mmq = { 128,              64,  64, 32, mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
+-        s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_warptile_wm, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
++        s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_wm(subgroup_size_32, subgroup_size_8, 2), 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+ 
+         // Integer MMQ has a smaller shared memory profile, but heavier register use
+         l_warptile_mmq_int = { 128,             128, 128, 32, mm_warp_8 * 2, 64, 2, 4, 4, 1, mm_warp_8 };
+         m_warptile_mmq_int = { 128,              64,  64, 32, mm_warp_8,     32, 2, 2, 2, 1, mm_warp_8 };
+-        s_warptile_mmq_int = { subgroup_size_32, 32,  32, 32, s_warptile_wm, 32, 2, 2, 1, 1, subgroup_size_8 };
++        s_warptile_mmq_int = { subgroup_size_32, 32,  32, 32, s_wm(subgroup_size_32, subgroup_size_8, 4), 32, 2, 2, 1, 1, subgroup_size_8 };
+ 
+         const auto cm1_bs = [cm1_sg](uint32_t bm, uint32_t bn) {
+             return cm1_sg * (bm / std::min(cm1_sg, bm)) * (bn / 32);
+@@ -1821,23 +1836,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         // K-quants use even more registers, mitigate by setting WMITER to 1
+         l_warptile_mmq_int_k = { 128,               128, 128, 32, mm_warp_8 * 2, 64, 1, 4, 4, 1, mm_warp_8 };
+         m_warptile_mmq_int_k = { 128,                64,  64, 32, mm_warp_8,     32, 1, 2, 2, 1, mm_warp_8 };
+-        s_warptile_mmq_int_k = { subgroup_size_32,   32,  32, 32, s_warptile_wm, 32, 1, 2, 1, 1, subgroup_size_8 };
++        s_warptile_mmq_int_k = { subgroup_size_32,   32,  32, 32, s_wm(subgroup_size_32, subgroup_size_8, 8), 32, 1, 2, 1, 1, subgroup_size_8 };
+ 
+         l_warptile_id = { 128,                      128, 128, 16, mul_mat_mm_warp_16 * 2, 64, 2, tm_l, tn_l, tk_l, mul_mat_mm_warp_16 };
+         m_warptile_id = { 128,                       64,  64, 16, mul_mat_mm_warp_16,     32, 2, tm_m, tn_m, tk_m, mul_mat_mm_warp_16 };
+-        s_warptile_id = { mul_mat_subgroup_size_16,  32,  32, 16, s_warptile_wm,          32, 2, tm_s, tn_s, tk_s, mul_mat_subgroup_size_16 };
++        s_warptile_id = { mul_mat_subgroup_size_16,  32,  32, 16, s_wm(mul_mat_subgroup_size_16, mul_mat_subgroup_size_16, 16),          32, 2, tm_s, tn_s, tk_s, mul_mat_subgroup_size_16 };
+ 
+         l_warptile_mmqid = { 128,                       128, 128, 32, mul_mat_mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mul_mat_mm_warp_8 };
+         m_warptile_mmqid = { 128,                        64,  64, 32, mul_mat_mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mul_mat_mm_warp_8 };
+-        s_warptile_mmqid = { mul_mat_subgroup_size_32,   32,  32, 32, s_warptile_wm,         32, 2, tm_s, tn_s, tk_s, mul_mat_subgroup_size_8 };
++        s_warptile_mmqid = { mul_mat_subgroup_size_32,   32,  32, 32, s_wm(mul_mat_subgroup_size_32, mul_mat_subgroup_size_8, 32),         32, 2, tm_s, tn_s, tk_s, mul_mat_subgroup_size_8 };
+ 
+         l_warptile_mmqid_int = { 128,                       128, 128, 32, mul_mat_mm_warp_8 * 2, 64, 2, 4, 4, 1, mul_mat_mm_warp_8 };
+         m_warptile_mmqid_int = { 128,                        64,  64, 32, mul_mat_mm_warp_8,     32, 2, 2, 2, 1, mul_mat_mm_warp_8 };
+-        s_warptile_mmqid_int = { mul_mat_subgroup_size_32,   32,  32, 32, s_warptile_wm,         32, 2, 2, 1, 1, mul_mat_subgroup_size_8 };
++        s_warptile_mmqid_int = { mul_mat_subgroup_size_32,   32,  32, 32, s_wm(mul_mat_subgroup_size_32, mul_mat_subgroup_size_8, 64),         32, 2, 2, 1, 1, mul_mat_subgroup_size_8 };
+ 
+         l_warptile_mmqid_int_k = { 128,                     128, 128, 32, mul_mat_mm_warp_16 * 2, 64, 1, 4, 4, 1, mul_mat_mm_warp_16 };
+         m_warptile_mmqid_int_k = { 128,                      64,  64, 32, mul_mat_mm_warp_16,     32, 1, 2, 2, 1, mul_mat_mm_warp_16 };
+-        s_warptile_mmqid_int_k = { mul_mat_subgroup_size_32, 32,  32, 32, s_warptile_wm,          32, 1, 2, 1, 1, mul_mat_subgroup_size_16 };
++        s_warptile_mmqid_int_k = { mul_mat_subgroup_size_32, 32,  32, 32, s_wm(mul_mat_subgroup_size_32, mul_mat_subgroup_size_16, 128),          32, 1, 2, 1, 1, mul_mat_subgroup_size_16 };
+ 
+         // chip specific tuning
+         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
+@@ -4020,6 +4035,8 @@ vk_device ggml_vk_get_device(size_t idx) {
+         bool coopmat2_support = false;
+         bool coopmat2_decode_vector_support = false;
+         bool pipeline_executable_properties_support = false;
++        bool dma_buf_ext = false;
++        bool memory_fd_ext = false;
+         bool internally_sync_support = false;
+         device->coopmat_support = false;
+         device->integer_dot_product = false;
+@@ -4088,6 +4105,10 @@ vk_device ggml_vk_get_device(size_t idx) {
+                 device->memory_priority = true;
+             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
+                 device->external_memory_host = true;
++            } else if (strcmp("VK_EXT_external_memory_dma_buf", properties.extensionName) == 0) {
++                dma_buf_ext = true;
++            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
++                memory_fd_ext = true;
+ #if defined(VK_EXT_shader_64bit_indexing)
+             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
+                 device->shader_64b_indexing = true;
+@@ -4440,6 +4461,12 @@ vk_device ggml_vk_get_device(size_t idx) {
+             device_extensions.push_back("VK_EXT_external_memory_host");
+         }
+ 
++        device->external_memory_dma_buf = dma_buf_ext && memory_fd_ext;
++        if (device->external_memory_dma_buf) {
++            device_extensions.push_back("VK_KHR_external_memory_fd");
++            device_extensions.push_back("VK_EXT_external_memory_dma_buf");
++        }
++
+ #if defined(VK_EXT_shader_64bit_indexing)
+         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
+         shader_64bit_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_64_BIT_INDEXING_FEATURES_EXT;
+@@ -7255,7 +7282,11 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
+     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
+     // when ne12 and ne13 are one.
+     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
++               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
++               // frontier-model: the q6_K mat-vec pipeline with exactly 5 columns faults the GPU on Mali-G710/panvk
++               // (CS_BUS_FAULT, device lost; 4 and 6-8 columns and other types are fine), so use the tiled matmul
++               !(ctx->device->vendor_id == 0x13B5 && src0->type == GGML_TYPE_Q6_K && dst->ne[1] == 5 &&
++                 !(getenv("GGML_VK_Q6K_N5_WORKAROUND") && atoi(getenv("GGML_VK_Q6K_N5_WORKAROUND")) == 0))) {
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+@@ -7872,7 +7903,10 @@ bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx)
+     ggml_tensor * dst = cgraph->nodes[node_idx];
+     ggml_tensor * src0 = dst->src[0];
+     ggml_tensor * src2 = dst->src[2];
+-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
++    // GGML_VK_MMV_ID_MAX_TOKENS (frontier-model experiment): use the mat-vec id kernel up to this many tokens
++    // (default 8). For MoE at small batches few tokens share an expert, so the tiled kernel wastes its columns.
++    static const int64_t max_tokens = getenv("GGML_VK_MMV_ID_MAX_TOKENS") ? atoll(getenv("GGML_VK_MMV_ID_MAX_TOKENS")) : 8;
++    return (src2->ne[1] <= max_tokens) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+ }
+ 
+ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+@@ -16000,6 +16034,16 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+     return ret;
+ }
+ 
++ggml_backend_buffer_t ggml_backend_vk_buffer_from_dmabuf(size_t dev_num, int fd, size_t size) {
++    vk_device device = ggml_vk_get_device(dev_num);
++    vk_buffer buf = ggml_vk_buffer_from_dmabuf(device, fd, size);
++    if (!buf) {
++        return nullptr;
++    }
++    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
++    return ggml_backend_buffer_init(ggml_backend_vk_buffer_type(dev_num), ggml_backend_vk_buffer_interface, bufctx, size);
++}
++
+ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
+     /* .get_name             = */ ggml_backend_vk_device_get_name,
+     /* .get_description      = */ ggml_backend_vk_device_get_description,
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc79..f1c110cad 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -75,3 +75,25 @@ if (BUILD_SHARED_LIBS)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+ endif()
++
++# frontier-model: flash-streamed MoE experts (runtime/estore)
++set(LLAMA_FM_ESTORE_DIR "" CACHE PATH "frontier-model runtime/ directory; enables expert streaming")
++if (LLAMA_FM_ESTORE_DIR)
++    find_package(PkgConfig REQUIRED)
++    pkg_check_modules(FM_URING REQUIRED IMPORTED_TARGET liburing)
++    target_sources(llama PRIVATE llama-estore.cpp ${LLAMA_FM_ESTORE_DIR}/estore.c)
++    target_include_directories(llama PRIVATE ${LLAMA_FM_ESTORE_DIR})
++    target_compile_definitions(llama PRIVATE LLAMA_FM_ESTORE)
++    target_link_libraries(llama PRIVATE PkgConfig::FM_URING)
++    set(LLAMA_FM_FINCH_DIR "" CACHE PATH "finch C API (include/finch.h, lib/libfinch_ffi.a); enables FM_ESTORE_PRED_TPU")
++    if (LLAMA_FM_FINCH_DIR)
++        target_compile_definitions(llama PRIVATE LLAMA_FM_FINCH)
++        target_include_directories(llama PRIVATE ${LLAMA_FM_FINCH_DIR}/include)
++        target_link_libraries(llama PRIVATE ${LLAMA_FM_FINCH_DIR}/lib/libfinch_ffi.a pthread dl m)
++    endif()
++    if (GGML_VULKAN)
++        # FM_ESTORE_VK: import the expert pools into Vulkan (dma-buf)
++        target_compile_definitions(llama PRIVATE LLAMA_FM_ESTORE_VK)
++        target_link_libraries(llama PRIVATE ggml-vulkan)
++    endif()
++endif()
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 27b9a38d7..7d8367998 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -408,7 +408,9 @@ llama_context::llama_context(
+             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+ 
+-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
++            // frontier-model: honour no_host here too. panvk's host buffer type is slow for CPU compute: 235B decode
++            // with a Vulkan device present took 77 s instead of 50 s with every op on the CPU
++            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() && !model.no_host()) {
+                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
+                 const auto & dev = model.devices[0];
+                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
+@@ -2181,7 +2183,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+         auto * buft = ggml_backend_cpu_buffer_type();
+         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
+         auto * output_dev = model.dev_output();
+-        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
++        auto * output_dev_host_buft = output_dev && !model.no_host() ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+         if (output_dev_host_buft) {
+             buft = output_dev_host_buft;
+         }
+@@ -2607,6 +2609,31 @@ llm_graph_cb llama_context::graph_get_cb() const {
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
++        // frontier-model FM_ESTORE_SPLIT: run the concat of the GPU and CPU expert outputs on the GPU, so the CPU
++        // expert chain forms a split with no GPU inputs and runs while the GPU chain computes
++        if (strcmp(name, "ffn_moe_down_cat") == 0) {
++            for (const auto & backend : backends) {
++                if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU &&
++                    ggml_backend_supports_op(backend.get(), cur)) {
++                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
++                    break;
++                }
++            }
++        }
++        // and keep the router (logits, probabilities, top-k, weights) and the CPU chain's expert ids on the CPU: left alone, the scheduler
++        // moves the top-k to the GPU, adding a CPU->GPU->CPU round trip to every layer
++        static const bool fm_split = getenv("FM_ESTORE_SPLIT") != nullptr;
++        if (fm_split && (strncmp(name, "ffn_moe_logits", 14) == 0 || strncmp(name, "ffn_moe_probs", 13) == 0 ||
++                         strcmp(name, "ffn_moe_topk") == 0 || strncmp(name, "ffn_moe_weights", 15) == 0 ||
++                         strcmp(name, "ffn_moe_ids_cpu") == 0)) {
++            for (const auto & backend : backends) {
++                if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
++                    break;
++                }
++            }
++        }
++
+         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+         if (ubatch.n_tokens < 32 || full_offload) {
+             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+diff --git a/src/llama-estore.cpp b/src/llama-estore.cpp
+new file mode 100644
+index 000000000..efe9fb95c
+--- /dev/null
++++ b/src/llama-estore.cpp
+@@ -0,0 +1,643 @@
++#include "llama-estore.h"
++
++#include "llama-impl.h"
++
++#include "ggml-backend.h"
++#include "estore.h"
++
++#ifdef LLAMA_FM_ESTORE_VK
++#include "ggml-vulkan.h"
++#endif
++#ifdef LLAMA_FM_FINCH
++#include "finch.h"
++#endif
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <sched.h>
++#include <condition_variable>
++#include <thread>
++#include <mutex>
++#include <string>
++#include <vector>
++
++struct llama_estore_layer {
++    llama_estore * es;
++    int            il;
++};
++
++// expert-prefetch predictor (tools/predictor/train.py --export): at layer il,
++// logits = W h + b over (layers il+1 .. il+span) x n_expert; prefetch top m
++struct llama_estore_stage {     // one int8 FC of a predictor
++    int din = 0, dout = 0;
++    std::vector<int8_t>  Wq;    // [dout, din]
++    std::vector<int32_t> bq;    // [dout]
++    double w_s = 0;
++};
++
++struct llama_estore_pred {
++    int il = -1;
++    std::vector<float> W, b;    // float form: [span*E, D], [span*E]
++    // int8 form (tools/tpu/make_predictors.py): one FC or a chain, the arithmetic the TPU runs
++    bool int8 = false;
++    std::vector<llama_estore_stage> stages;
++    std::vector<double> acts;   // activation scales: input, (between stages,) output
++    int tpu_id = -1;            // finch executable id when the predictor runs on the TPU
++};
++
++struct llama_estore {
++    estore * st = nullptr;
++    int pred_d = 0, pred_e = 0, pred_span = 0, pred_m = 8;
++    float pred_logit_min = 0.0f;                // prefetch only if sigmoid(logit) > FM_ESTORE_PRED_P
++    std::vector<llama_estore_pred *> pred;      // [n_layer], nullptr where none
++    std::vector<float> pred_logits;
++    std::vector<int8_t> pred_xq, pred_hq, pred_yq;
++#ifdef LLAMA_FM_FINCH
++    finch_ctx * tpu = nullptr;  // FM_ESTORE_PRED_TPU: predictors run on the Edge TPU through finch
++    bool tpu_sync = true;       // dispatch and wait inline (default); FM_ESTORE_TPU_ASYNC=1: the collector thread
++    // async: the collector thread runs the newest request on the TPU and prefetches from it at once
++    std::mutex tpu_mtx;
++    std::condition_variable tpu_cv;
++    int tpu_req_il = -1;        // layer of the pending request, -1 when none
++    std::vector<int8_t> tpu_req_xq;
++    uint64_t tpu_replaced = 0;  // requests overwritten by a newer one before the collector took them
++    uint64_t tpu_dispatch_ns = 0, tpu_lock_wait_ns = 0, tpu_hold_ns = 0;   // collector: finch_dispatch, waiting for mtx, holding it
++#endif
++    int cur_il = -1;            // layer most recently acquired (prefetches for it and earlier are skipped)
++    uint64_t lock_wait_ns = 0;  // residency ops: time spent waiting for mtx
++    uint64_t resid_ns = 0;      // residency ops: total time (lock wait, acquire incl. I/O stall, prediction)
++    ggml_context * ctx = nullptr;               // metadata for the pool tensors
++    ggml_backend_buffer_t buf = nullptr;        // wraps the estore memfd mapping (CPU pools)
++    // FM_ESTORE_VK: [group][proj] Vulkan buffers imported from the pools' dma-bufs (GPU pools)
++    std::vector<std::vector<ggml_backend_buffer_t>> vk_bufs;
++    std::vector<llama_estore_layer> layers;     // custom-op userdata
++    // [group][proj] pool tensors, created on first use
++    std::vector<std::vector<ggml_tensor *>> pools;
++    std::vector<std::vector<ggml_tensor *>> pools_gpu;   // FM_ESTORE_SPLIT: the Vulkan views of the same pools
++    int split_gpu = 0;                          // FM_ESTORE_SPLIT: experts per token computed on the GPU
++    std::vector<int> scratch_experts, scratch_slots, expert_slot;
++    std::vector<uint8_t> seen;
++    std::mutex mtx;
++};
++
++static ggml_type type_from_name(const char * name) {
++    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++        const char * n = ggml_type_name((ggml_type) t);
++        if (n && strcasecmp(n, name) == 0) {
++            return (ggml_type) t;
++        }
++    }
++    return GGML_TYPE_COUNT;
++}
++
++static uint64_t estore_now_ns() {
++    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++static void estore_print_stats() {
++    llama_estore * es = llama_estore_get(0);
++    if (!es) {
++        return;
++    }
++    estore_stats s;
++    estore_get_stats(es->st, &s);
++    const double acc = (double) (s.hits + s.inflight_hits + s.misses);
++    fprintf(stderr, "estore: %.0f expert accesses: hit %.4f, inflight hit %.4f, miss %.4f; %lu prefetches (%.3f used); "
++                    "%.3f GB read; %.3f s stalled, %.3f s submitting reads; %lu stale prefetches dropped\n",
++            acc, s.hits / acc, s.inflight_hits / acc, s.misses / acc, (unsigned long) s.prefetches,
++            s.prefetches ? (double) s.prefetch_used / s.prefetches : 0.0, s.bytes_read / 1e9, s.stall_ns / 1e9, s.submit_ns / 1e9, (unsigned long) s.prefetch_dropped);
++    fprintf(stderr, "estore: residency ops took %.3f s in all, %.3f s of it waiting for the store lock\n", es->resid_ns / 1e9, es->lock_wait_ns / 1e9);
++#ifdef LLAMA_FM_FINCH
++    if (es->tpu && !es->tpu_sync) {
++        fprintf(stderr, "estore: TPU collector: %lu predictions replaced by a newer one before they ran; %.3f s in finch_dispatch, %.3f s waiting for and %.3f s holding the store lock\n",
++                (unsigned long) es->tpu_replaced, es->tpu_dispatch_ns / 1e9, es->tpu_lock_wait_ns / 1e9, es->tpu_hold_ns / 1e9);
++    }
++#endif
++}
++
++#ifdef LLAMA_FM_FINCH
++// Register the TPU predictor executables before the expert pools exist: the mainline TPU driver
++// backs each buffer with physically contiguous pages, which are hard to find once GBs of pool memory
++// are allocated (registration then fails with ENOMEM).
++// pin the calling thread to FM_FINCH_CPUS (default the little cores, "0-3")
++static void estore_pin_finch_cpus(const char * what) {
++    const char * spec = getenv("FM_FINCH_CPUS") ? getenv("FM_FINCH_CPUS") : "0-3";
++    cpu_set_t set;
++    CPU_ZERO(&set);
++    int a = -1, b = -1;
++    if (sscanf(spec, "%d-%d", &a, &b) == 2) {
++        for (int c = a; c <= b; ++c) CPU_SET(c, &set);
++    } else if (sscanf(spec, "%d", &a) == 1) {
++        CPU_SET(a, &set);
++    }
++    if (CPU_COUNT(&set) > 0 && sched_setaffinity(0, sizeof(set), &set) != 0) {
++        LLAMA_LOG_WARN("%s: cannot pin the %s to CPUs %s\n", __func__, what, spec);
++    }
++}
++
++static void estore_tpu_collector(llama_estore * es);
++
++static finch_ctx * estore_tpu_preregister(const std::string & d, std::map<int, uint32_t> & ids) {
++    // finch_open starts finch's worker thread, and a new thread inherits its creator's CPU mask: open
++    // from a helper pinned to FM_FINCH_CPUS (default the little cores, "0-3") so the worker never takes
++    // time from the decode threads
++    finch_ctx * tpu = nullptr;
++    int rc = FINCH_ERR;
++    std::string err;
++    std::thread opener([&]() {
++        estore_pin_finch_cpus("finch worker");
++        rc = finch_open(nullptr, &tpu);
++        if (rc != FINCH_OK) err = finch_last_error(nullptr);
++    });
++    opener.join();
++    if (rc != FINCH_OK) {
++        GGML_ABORT("FM_ESTORE_PRED_TPU: finch_open: %s", err.c_str());
++    }
++    LLAMA_LOG_INFO("%s: finch worker on CPUs %s\n", __func__, getenv("FM_FINCH_CPUS") ? getenv("FM_FINCH_CPUS") : "0-3");
++    FILE * f = fopen((d + "/manifest.txt").c_str(), "r");
++    int span = 0, il, ns;
++    if (!f || fscanf(f, " span %d", &span) != 1) GGML_ABORT("FM_ESTORE_PRED_TPU: bad %s/manifest.txt", d.c_str());
++    while (fscanf(f, "%d %d", &il, &ns) == 2 && ns >= 1 && ns <= 4) {
++        std::vector<double> v(2 * ns + 2 + ns);            // dims (ns+1), act scales (ns+1), weight scales (ns)
++        for (auto & x : v) if (fscanf(f, "%lf", &x) != 1) GGML_ABORT("bad manifest row for layer %d", il);
++        const size_t in_sz = (size_t) v[0], out_sz = (size_t) v[ns];
++        const std::string bin = d + "/pred_" + std::to_string(il) + ".bin";
++        FILE * bf = fopen(bin.c_str(), "rb");
++        if (!bf) GGML_ABORT("FM_ESTORE_PRED_TPU: missing %s", bin.c_str());
++        std::vector<char> exe;
++        char buf[1 << 16];
++        size_t n;
++        while ((n = fread(buf, 1, sizeof(buf), bf)) > 0) exe.insert(exe.end(), buf, buf + n);
++        fclose(bf);
++        uint32_t id;
++        if (finch_register(tpu, exe.data(), exe.size(), &in_sz, 1, &out_sz, 1, &id) != FINCH_OK) {
++            GGML_ABORT("FM_ESTORE_PRED_TPU: register layer %d: %s", il, finch_last_error(tpu));
++        }
++        ids[il] = id;
++    }
++    fclose(f);
++    return tpu;
++}
++#endif
++
++llama_estore * llama_estore_get(int n_layer) {
++    static std::once_flag once;
++    static llama_estore * inst = nullptr;
++    std::call_once(once, [&]() {
++        const char * pack = getenv("FM_ESTORE_PACK");
++        if (!pack || !*pack) {
++            return;
++        }
++        std::string index = getenv("FM_ESTORE_INDEX") ? getenv("FM_ESTORE_INDEX") : std::string(pack) + ".idx";
++        const double pool_gb = getenv("FM_ESTORE_POOL_GB") ? atof(getenv("FM_ESTORE_POOL_GB")) : 7.0;
++        estore_cfg cfg = {};
++        cfg.pack       = pack;
++        cfg.index      = index.c_str();
++        cfg.pool_bytes = (uint64_t) (pool_gb * 1e9);
++        cfg.qd         = getenv("FM_ESTORE_QD") ? atoi(getenv("FM_ESTORE_QD")) : 16;
++        cfg.hugetlb    = getenv("FM_ESTORE_HUGETLB") ? 1 : 0;
++        cfg.prefetch_qd = getenv("FM_ESTORE_PREFETCH_QD") ? atoi(getenv("FM_ESTORE_PREFETCH_QD")) : 2;
++        // the G710 does not snoop the CPU caches that coherent UFS DMA writes land in: when it reads the
++        // pools (FM_ESTORE_VK), every landed slot must be cleaned to DRAM
++        cfg.clean_slots = (getenv("FM_ESTORE_CLEAN") || getenv("FM_ESTORE_VK") || getenv("FM_ESTORE_SPLIT")) ? 1 : 0;
++        cfg.prefetch_buffer = getenv("FM_ESTORE_PF_BUFFER") ? atoi(getenv("FM_ESTORE_PF_BUFFER")) : 0;
++        // on by default (=0 turns them off): with UFS's shallow block queue a blocking submit stalls
++        // whichever thread issues the read, and queued prefetch requests delay demand reads
++        cfg.async_submit   = !getenv("FM_ESTORE_ASYNC_SUBMIT") || atoi(getenv("FM_ESTORE_ASYNC_SUBMIT")) != 0;
++        cfg.pf_ioprio_idle = !getenv("FM_ESTORE_PF_IDLE") || atoi(getenv("FM_ESTORE_PF_IDLE")) != 0;
++        static int * layer_weights = nullptr;   // FM_ESTORE_SHARES: per-layer shares (tools/sim/policy_lab.py alloc --save)
++        if (const char * sp = getenv("FM_ESTORE_SHARES")) {
++            cfg.n_layer_weights = estore_read_layer_weights(sp, &layer_weights);
++            if (cfg.n_layer_weights < 0) GGML_ABORT("FM_ESTORE_SHARES: cannot read %s", sp);
++            cfg.layer_weights = layer_weights;
++            LLAMA_LOG_INFO("%s: per-layer expert shares from %s\n", __func__, sp);
++        }
++        cfg.policy = getenv("FM_ESTORE_POLICY") && !strcmp(getenv("FM_ESTORE_POLICY"), "lru") ? ESTORE_POLICY_LRU : ESTORE_POLICY_LAYER;
++#ifdef LLAMA_FM_FINCH
++        std::map<int, uint32_t> tpu_ids;
++        finch_ctx * tpu = nullptr;
++        if (getenv("FM_ESTORE_PRED_TPU") && getenv("FM_ESTORE_PRED_INT8")) {
++            tpu = estore_tpu_preregister(getenv("FM_ESTORE_PRED_INT8"), tpu_ids);
++        }
++#endif
++        estore * st = estore_open(&cfg);
++        if (!st) {
++            GGML_ABORT("FM_ESTORE_PACK=%s: estore_open failed", pack);
++        }
++        if (estore_n_layer(st) != n_layer) {
++            GGML_ABORT("expert pack has %d layers, model has %d", estore_n_layer(st), n_layer);
++        }
++        auto * es = new llama_estore();
++        es->st = st;
++
++        // one CPU buffer over the whole pool mapping; tensors are placed at their pool offsets
++        const int ng = estore_n_groups(st);
++        size_t total = 0;
++        for (int g = 0; g < ng; ++g) {
++            for (int p = 0; p < estore_n_proj(st, g); ++p) {
++                total = std::max<size_t>(total, estore_pool_offset(st, g, p) +
++                                         (size_t) estore_n_slots(st, g) * estore_proj_size(st, g, p));
++            }
++        }
++        es->buf = ggml_backend_cpu_buffer_from_ptr(estore_pool(st, 0, 0), total);
++        // the pools are the expert weights: flag them so the scheduler runs their ops where they live
++        // instead of copying GBs of "inputs" to another backend
++        ggml_backend_buffer_set_usage(es->buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        const char * vk = getenv("FM_ESTORE_VK");
++        if (!vk && getenv("FM_ESTORE_SPLIT")) vk = "0";   // the split needs the Vulkan views too
++        if (vk) {
++#ifdef LLAMA_FM_ESTORE_VK
++            // zero-copy: the GPU reads the same pages io_uring fills
++            if (!estore_dmabuf_ok(st)) {
++                GGML_ABORT("FM_ESTORE_VK: the pools have no dma-bufs (is /dev/udmabuf usable?)");
++            }
++            const int dev = atoi(vk);
++            es->vk_bufs.assign(ng, std::vector<ggml_backend_buffer_t>(ESTORE_MAX_PROJ, nullptr));
++            for (int g = 0; g < ng; ++g) {
++                for (int p = 0; p < estore_n_proj(st, g); ++p) {
++                    es->vk_bufs[g][p] = ggml_backend_vk_buffer_from_dmabuf(dev, estore_pool_dmabuf_fd(st, g, p), estore_pool_bytes(st, g, p));
++                    if (!es->vk_bufs[g][p]) {
++                        GGML_ABORT("FM_ESTORE_VK: Vulkan device %d cannot import pool g%d.%s", dev, g, estore_proj_name(st, g, p));
++                    }
++                    ggml_backend_buffer_set_usage(es->vk_bufs[g][p], GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                }
++            }
++            LLAMA_LOG_INFO("%s: expert pools imported into Vulkan device %d (dma-buf, zero-copy)\n", __func__, dev);
++#else
++            GGML_UNUSED(vk);
++            GGML_ABORT("FM_ESTORE_VK: llama was built without the Vulkan backend");
++#endif
++        }
++        ggml_init_params ip = { ggml_tensor_overhead() * ESTORE_MAX_GROUPS * ESTORE_MAX_PROJ * 2, nullptr, true };
++        es->ctx = ggml_init(ip);
++        es->pools.assign(ng, std::vector<ggml_tensor *>(ESTORE_MAX_PROJ, nullptr));
++        es->pools_gpu.assign(ng, std::vector<ggml_tensor *>(ESTORE_MAX_PROJ, nullptr));
++        if (const char * sp = getenv("FM_ESTORE_SPLIT")) {
++            es->split_gpu = atoi(sp);
++            LLAMA_LOG_INFO("%s: split experts: %d per token on the GPU, the rest on the CPU\n", __func__, es->split_gpu);
++        }
++        es->layers.resize(n_layer);
++        int max_expert = 0;
++        for (int il = 0; il < n_layer; ++il) {
++            es->layers[il] = { es, il };
++            max_expert = std::max(max_expert, estore_n_expert(st, il));
++        }
++        es->expert_slot.resize(max_expert);
++        es->seen.resize(max_expert);
++        es->pred.assign(n_layer, nullptr);
++        if (const char * dir = getenv("FM_ESTORE_PRED_INT8")) {
++            // int8 predictors as packaged for the TPU: manifest.txt + pred_<l>.s<k>.w.i8 / .b.i32 (+ pred_<l>.bin)
++            std::string d = dir;
++            FILE * f = fopen((d + "/manifest.txt").c_str(), "r");
++            if (!f || fscanf(f, " span %d", &es->pred_span) != 1 || es->pred_span <= 0) {
++                GGML_ABORT("FM_ESTORE_PRED_INT8=%s: bad manifest.txt", dir);
++            }
++            int n_pl = 0, il, ns;
++            while (fscanf(f, "%d %d", &il, &ns) == 2) {
++                if (il < 0 || il >= n_layer || ns < 1 || ns > 4) GGML_ABORT("bad manifest.txt row for layer %d", il);
++                auto * pr = new llama_estore_pred();
++                pr->il = il;
++                pr->int8 = true;
++                std::vector<int> dims(ns + 1);
++                pr->acts.resize(ns + 1);
++                pr->stages.resize(ns);
++                bool ok = true;
++                for (int k = 0; k <= ns; ++k) ok &= fscanf(f, "%d", &dims[k]) == 1;
++                for (int k = 0; k <= ns; ++k) ok &= fscanf(f, "%lf", &pr->acts[k]) == 1;
++                for (int k = 0; k < ns; ++k) ok &= fscanf(f, "%lf", &pr->stages[k].w_s) == 1;
++                if (!ok || dims[ns] % es->pred_span) GGML_ABORT("bad manifest.txt row for layer %d", il);
++                for (int k = 0; k < ns; ++k) {
++                    auto & st = pr->stages[k];
++                    st.din = dims[k];
++                    st.dout = dims[k + 1];
++                    st.Wq.resize((size_t) st.dout * st.din);
++                    st.bq.resize(st.dout);
++                    const std::string base = d + "/pred_" + std::to_string(il) + ".s" + std::to_string(k);
++                    FILE * w = fopen((base + ".w.i8").c_str(), "rb");
++                    FILE * bf = fopen((base + ".b.i32").c_str(), "rb");
++                    if (!w || !bf || fread(st.Wq.data(), 1, st.Wq.size(), w) != st.Wq.size() ||
++                        fread(st.bq.data(), sizeof(int32_t), st.bq.size(), bf) != st.bq.size()) {
++                        GGML_ABORT("FM_ESTORE_PRED_INT8=%s: cannot read stage %d of layer %d", dir, k, il);
++                    }
++                    fclose(w);
++                    fclose(bf);
++                }
++                es->pred_d = dims[0];
++                es->pred_e = dims[ns] / es->pred_span;
++                es->pred[il] = pr;
++                n_pl++;
++            }
++            fclose(f);
++            es->pred_m = getenv("FM_ESTORE_PRED_M") ? atoi(getenv("FM_ESTORE_PRED_M")) : 8;
++            const float p_min = getenv("FM_ESTORE_PRED_P") ? atof(getenv("FM_ESTORE_PRED_P")) : 0.5f;
++            es->pred_logit_min = logf(p_min / (1.0f - p_min));
++            const size_t n_out = (size_t) es->pred_span * es->pred_e;
++            es->pred_logits.resize(n_out);
++            es->pred_xq.resize(es->pred_d);
++            es->pred_hq.resize(2 * 4096);
++            es->pred_yq.resize(n_out);
++            const char * where = "CPU, TPU arithmetic";
++            if (getenv("FM_ESTORE_PRED_TPU")) {
++#ifdef LLAMA_FM_FINCH
++                es->tpu = tpu;    // opened and registered before the pools were allocated
++                // sync (dispatch and wait inline) is the default: on the Fold it is 1-2% faster than the
++                // collector thread for both 30B and 235B; FM_ESTORE_TPU_ASYNC=1 selects the collector
++                es->tpu_sync = !getenv("FM_ESTORE_TPU_ASYNC") || atoi(getenv("FM_ESTORE_TPU_ASYNC")) == 0;
++                for (auto * pr : es->pred) {
++                    if (!pr) continue;
++                    auto it = tpu_ids.find(pr->il);
++                    if (it == tpu_ids.end()) GGML_ABORT("FM_ESTORE_PRED_TPU: no executable for layer %d", pr->il);
++                    pr->tpu_id = (int) it->second;
++                }
++                if (!es->tpu_sync) std::thread(estore_tpu_collector, es).detach();
++                where = es->tpu_sync ? "Edge TPU, sync" : "Edge TPU, async";
++#else
++                GGML_ABORT("FM_ESTORE_PRED_TPU: llama was built without finch (LLAMA_FM_FINCH_DIR)");
++#endif
++            }
++            LLAMA_LOG_INFO("%s: %d int8 prefetch predictors (%s; span %d, top %d, p > %.2f) from %s\n", __func__, n_pl,
++                           where, es->pred_span, es->pred_m, p_min, dir);
++        } else if (const char * dir = getenv("FM_ESTORE_PRED")) {
++            std::string d = dir;
++            FILE * f = fopen((d + "/pred.txt").c_str(), "r");
++            int n_pl = 0, ver = 0;
++            if (!f || fscanf(f, "fmpred %d %d %d %d %d", &ver, &es->pred_d, &es->pred_e, &es->pred_span, &n_pl) != 5 || ver != 1) {
++                GGML_ABORT("FM_ESTORE_PRED=%s: bad pred.txt", dir);
++            }
++            const size_t n_out = (size_t) es->pred_span * es->pred_e;
++            for (int i = 0; i < n_pl; ++i) {
++                int il;
++                if (fscanf(f, "%d", &il) != 1 || il < 0 || il >= n_layer) GGML_ABORT("bad pred.txt layer list");
++                auto * pr = new llama_estore_pred();
++                pr->il = il;
++                pr->W.resize(n_out * es->pred_d);
++                pr->b.resize(n_out);
++                FILE * w = fopen((d + "/pred_" + std::to_string(il) + ".f32").c_str(), "rb");
++                if (!w || fread(pr->W.data(), sizeof(float), pr->W.size(), w) != pr->W.size() ||
++                    fread(pr->b.data(), sizeof(float), pr->b.size(), w) != pr->b.size()) {
++                    GGML_ABORT("FM_ESTORE_PRED=%s: cannot read predictor for layer %d", dir, il);
++                }
++                fclose(w);
++                es->pred[il] = pr;
++            }
++            fclose(f);
++            es->pred_m = getenv("FM_ESTORE_PRED_M") ? atoi(getenv("FM_ESTORE_PRED_M")) : 8;
++            const float p_min = getenv("FM_ESTORE_PRED_P") ? atof(getenv("FM_ESTORE_PRED_P")) : 0.5f;
++            es->pred_logit_min = logf(p_min / (1.0f - p_min));
++            es->pred_logits.resize(n_out);
++            LLAMA_LOG_INFO("%s: %d prefetch predictors (span %d, top %d, p > %.2f) from %s\n", __func__, n_pl, es->pred_span, es->pred_m, p_min, dir);
++        }
++        LLAMA_LOG_INFO("%s: streaming experts from %s: %d layer groups, %.2f GB pool, dma-bufs %s\n",
++                       __func__, pack, ng, pool_gb, estore_dmabuf_ok(st) ? "yes" : "no");
++        inst = es;
++        if (getenv("FM_ESTORE_STATS")) {
++            atexit(estore_print_stats);
++        }
++    });
++    return inst;
++}
++
++int llama_estore_split_gpu(const llama_estore * es) {
++    return es ? es->split_gpu : 0;
++}
++
++bool llama_estore_resident(llama_estore * es, int il, int expert) {
++    std::lock_guard<std::mutex> lock(es->mtx);
++    return estore_resident(es->st, il, expert) > 0;
++}
++
++ggml_tensor * llama_estore_pool(llama_estore * es, int il, const char * proj, const ggml_tensor * exps, bool gpu) {
++    std::lock_guard<std::mutex> lock(es->mtx);
++    estore * st = es->st;
++    const int g = estore_layer_group(st, il);
++    int p = 0;
++    while (p < estore_n_proj(st, g) && strcmp(estore_proj_name(st, g, p), proj) != 0) {
++        p++;
++    }
++    GGML_ASSERT(p < estore_n_proj(st, g) && "projection missing from the expert pack");
++    // split mode keeps both views: the CPU view by default, the Vulkan view for gpu; otherwise the one view
++    // is Vulkan when FM_ESTORE_VK imported the pools
++    const bool split = es->split_gpu > 0;
++    const bool want_vk = split ? gpu : !es->vk_bufs.empty();
++    GGML_ASSERT((!gpu || split) && "estore: a GPU pool view needs FM_ESTORE_SPLIT");
++    ggml_tensor *& t = (split && gpu) ? es->pools_gpu[g][p] : es->pools[g][p];
++    const ggml_type type = type_from_name(estore_proj_type(st, g, p));
++    if (type != exps->type || ggml_row_size(type, exps->ne[0]) * exps->ne[1] != estore_proj_size(st, g, p)) {
++        GGML_ABORT("layer %d %s: pack has %s/%lu B per expert, model has %s/%zu B",
++                   il, proj, estore_proj_type(st, g, p), (unsigned long) estore_proj_size(st, g, p),
++                   ggml_type_name(exps->type), ggml_row_size(exps->type, exps->ne[0]) * exps->ne[1]);
++    }
++    if (!t) {
++        t = ggml_new_tensor_3d(es->ctx, type, exps->ne[0], exps->ne[1], estore_n_slots(st, g));
++        ggml_format_name(t, want_vk && split ? "estore_pool_gpu.g%d.%s" : "estore_pool.g%d.%s", g, proj);
++        ggml_backend_buffer_t buf = es->buf;
++        void * base = (char *) estore_pool(st, 0, 0) + estore_pool_offset(st, g, p);
++        GGML_ASSERT(((uintptr_t) base % 64) == 0);
++        if (want_vk) {
++            buf  = es->vk_bufs[g][p];
++            base = ggml_backend_buffer_get_base(buf);   // slot 0 is at offset 0 of the pool's dma-buf
++        }
++        if (ggml_backend_tensor_alloc(buf, t, base) != GGML_STATUS_SUCCESS) {
++            GGML_ABORT("estore: cannot place pool tensor");
++        }
++    }
++    GGML_ASSERT(t->ne[0] == exps->ne[0] && t->ne[1] == exps->ne[1]);
++    return t;
++}
++
++// prefetch the top experts of layers pr->il+1 .. +span whose logits are in es->pred_logits,
++// skipping layers at or before `cur` (already acquired)
++static void estore_issue_prefetch(llama_estore * es, int il, int cur) {
++    const int E = es->pred_e;
++    std::vector<int> order(E);
++    for (int s = 0; s < es->pred_span; ++s) {
++        const int lp = il + 1 + s;
++        if (lp >= (int) es->layers.size()) break;
++        if (lp <= cur) continue;
++        const float * ls = es->pred_logits.data() + (size_t) s * E;
++        for (int e = 0; e < E; ++e) order[e] = e;
++        const int m = std::min(es->pred_m, E);
++        std::partial_sort(order.begin(), order.begin() + m, order.end(), [&](int a, int b) { return ls[a] > ls[b]; });
++        for (int k = 0; k < m && ls[order[k]] > es->pred_logit_min; ++k) {
++            estore_prefetch(es->st, lp, order[k]);
++        }
++    }
++}
++
++static int8_t q8(double v) { return (int8_t) std::min(127.0, std::max(-128.0, std::nearbyint(v))); }
++
++// symmetric int8 FC chain as TFLite/finch run it (tools/predictor/train.py int8_fc): int32 accumulate,
++// requantize to the next activation scale, clamp; writes the final int8 outputs to yq
++static void estore_int8_chain(llama_estore * es, const llama_estore_pred * pr, const int8_t * xq, int8_t * yq) {
++    const int8_t * in = xq;
++    for (size_t k = 0; k < pr->stages.size(); ++k) {
++        const auto & st = pr->stages[k];
++        // stage outputs alternate between two intermediate buffers so no stage reads what it writes
++        int8_t * out = k + 1 == pr->stages.size() ? yq : es->pred_hq.data() + (k % 2) * 4096;
++        GGML_ASSERT(k + 1 == pr->stages.size() || st.dout <= 4096);
++        const double mult = pr->acts[k] * st.w_s / pr->acts[k + 1];
++        for (int o = 0; o < st.dout; ++o) {
++            const int8_t * w = &st.Wq[(size_t) o * st.din];
++            int32_t acc = st.bq[o];
++            for (int i = 0; i < st.din; ++i) acc += (int32_t) w[i] * in[i];
++            out[o] = q8(acc * mult);
++        }
++        in = out;
++    }
++}
++
++static void estore_int8_logits(llama_estore * es, const llama_estore_pred * pr, const int8_t * yq) {
++    const double out_s = pr->acts.back();
++    for (size_t o = 0; o < es->pred_logits.size(); ++o) es->pred_logits[o] = (float) (yq[o] * out_s);
++}
++
++#ifdef LLAMA_FM_FINCH
++// async TPU predictions: the only thread that calls finch after registration. Takes the newest request,
++// runs it, and issues its prefetches as soon as the TPU returns, while the decode threads compute the
++// layer; only layers acquired in the meantime are skipped. (Collecting at the next residency op instead
++// loses the first of the span's layers and a layer of lead time for the rest.)
++static void estore_tpu_collector(llama_estore * es) {
++    estore_pin_finch_cpus("TPU collector");
++    std::vector<int8_t> xq, yq(es->pred_yq.size());
++    for (;;) {
++        int il;
++        {
++            std::unique_lock<std::mutex> lk(es->tpu_mtx);
++            es->tpu_cv.wait(lk, [es] { return es->tpu_req_il >= 0; });
++            il = es->tpu_req_il;
++            es->tpu_req_il = -1;
++            xq.swap(es->tpu_req_xq);
++        }
++        const llama_estore_pred * pr = es->pred[il];
++        const void * ins[1] = { xq.data() };
++        void * outs[1] = { yq.data() };
++        const uint64_t t0 = estore_now_ns();
++        if (finch_dispatch(es->tpu, (uint32_t) pr->tpu_id, ins, outs) != FINCH_OK) {
++            GGML_ABORT("finch_dispatch (layer %d): %s", il, finch_last_error(es->tpu));
++        }
++        const uint64_t t_d = estore_now_ns();
++        std::lock_guard<std::mutex> lock(es->mtx);
++        const uint64_t t1 = estore_now_ns();
++        estore_int8_logits(es, pr, yq.data());
++        estore_issue_prefetch(es, il, es->cur_il);
++        es->tpu_dispatch_ns += t_d - t0;
++        es->tpu_lock_wait_ns += t1 - t_d;
++        es->tpu_hold_ns += estore_now_ns() - t1;
++    }
++}
++#endif
++
++// run the predictor of layer il on router input x (f32 [pred_d]) and issue prefetches
++static void estore_predict(llama_estore * es, const llama_estore_pred * pr, const float * x, int il) {
++    const int D = es->pred_d;
++    if (!pr->int8) {
++        float * lg = es->pred_logits.data();
++        for (size_t o = 0; o < es->pred_logits.size(); ++o) {
++            const float * w = &pr->W[o * D];
++            float acc = pr->b[o];
++            for (int i = 0; i < D; ++i) acc += w[i] * x[i];
++            lg[o] = acc;
++        }
++        estore_issue_prefetch(es, il, il);
++        return;
++    }
++    int8_t * xq = es->pred_xq.data();
++    for (int i = 0; i < D; ++i) xq[i] = q8(x[i] / pr->acts[0]);
++#ifdef LLAMA_FM_FINCH
++    if (es->tpu) {
++        const void * ins[1] = { xq };
++        if (es->tpu_sync) {
++            void * outs[1] = { es->pred_yq.data() };
++            if (finch_dispatch(es->tpu, (uint32_t) pr->tpu_id, ins, outs) != FINCH_OK) {
++                GGML_ABORT("finch_dispatch: %s", finch_last_error(es->tpu));
++            }
++            estore_int8_logits(es, pr, es->pred_yq.data());
++            estore_issue_prefetch(es, il, il);
++        } else {
++            // hand off to the collector; a request it hasn't taken yet is stale, so replace it
++            {
++                std::lock_guard<std::mutex> lk(es->tpu_mtx);
++                es->tpu_replaced += es->tpu_req_il >= 0;
++                es->tpu_req_il = il;
++                es->tpu_req_xq.assign(xq, xq + D);
++            }
++            es->tpu_cv.notify_one();
++        }
++        return;
++    }
++#endif
++    estore_int8_chain(es, pr, xq, es->pred_yq.data());
++    estore_int8_logits(es, pr, es->pred_yq.data());
++    estore_issue_prefetch(es, il, il);
++}
++
++// dst = slot of src[0] (ids), per element; runs on one thread
++static void estore_residency_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * lu = (llama_estore_layer *) userdata;
++    llama_estore * es = lu->es;
++    const ggml_tensor * ids = dst->src[0];
++    const int64_t n_used = ids->ne[0];
++    const int64_t n_tok  = ids->ne[1];
++
++    const uint64_t t_lock = estore_now_ns();
++    std::lock_guard<std::mutex> lock(es->mtx);
++    es->lock_wait_ns += estore_now_ns() - t_lock;
++    es->cur_il = lu->il;   // being acquired now: the demand path takes it, prefetching it is too late
++    std::fill(es->seen.begin(), es->seen.end(), 0);
++    es->scratch_experts.clear();
++    for (int64_t t = 0; t < n_tok; ++t) {
++        const int32_t * row = (const int32_t *) ((const char *) ids->data + t * ids->nb[1]);
++        for (int64_t k = 0; k < n_used; ++k) {
++            if (!es->seen[row[k]]) {
++                es->seen[row[k]] = 1;
++                es->scratch_experts.push_back(row[k]);
++            }
++        }
++    }
++    // GPU batch: the pools are read on the GPU this time (FM_ESTORE_VK always; FM_ESTORE_SPLIT only for batches the
++    // graph splits, n_tokens >= FM_ESTORE_SPLIT_MIN_TOKENS, default 32, as in llama-graph.cpp)
++    static const int64_t split_min = getenv("FM_ESTORE_SPLIT_MIN_TOKENS") ? atoll(getenv("FM_ESTORE_SPLIT_MIN_TOKENS")) : 32;
++    estore_set_gpu_batch(es->st, getenv("FM_ESTORE_VK") != nullptr || (es->split_gpu > 0 && n_tok >= split_min));
++    es->scratch_slots.resize(es->scratch_experts.size());
++    if (estore_acquire(es->st, lu->il, (int) es->scratch_experts.size(),
++                       es->scratch_experts.data(), es->scratch_slots.data()) != 0) {
++        GGML_ABORT("estore_acquire failed (layer %d, %zu experts)", lu->il, es->scratch_experts.size());
++    }
++    for (size_t i = 0; i < es->scratch_experts.size(); ++i) {
++        es->expert_slot[es->scratch_experts[i]] = es->scratch_slots[i];
++    }
++    for (int64_t t = 0; t < n_tok; ++t) {
++        const int32_t * row = (const int32_t *) ((const char *) ids->data + t * ids->nb[1]);
++        int32_t * out = (int32_t *) ((char *) dst->data + t * dst->nb[1]);
++        for (int64_t k = 0; k < n_used; ++k) {
++            out[k] = es->expert_slot[row[k]];
++        }
++    }
++
++    // decode: predict the next layers' experts from this layer's router input and
++    // start their reads; they overlap with this layer's compute. (Prefill needs
++    // no prediction: its per-layer union of experts already keeps the queue deep.)
++    const llama_estore_pred * pr = es->pred[lu->il];
++    const ggml_tensor * h = dst->src[1];
++    if (pr && h && n_tok == 1) {
++        GGML_ASSERT(h->type == GGML_TYPE_F32 && h->ne[0] == es->pred_d);
++        estore_predict(es, pr, (const float *) h->data, lu->il);
++    }
++    es->resid_ns += estore_now_ns() - t_lock;
++}
++
++ggml_tensor * llama_estore_residency(llama_estore * es, ggml_context * ctx, ggml_tensor * ids, ggml_tensor * h, int il) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    ggml_tensor * args[2] = { ids, h };
++    const int n_args = es->pred[il] ? 2 : 1;   // the router input is only needed at predictor layers
++    return ggml_custom_4d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1], 1, 1, args, n_args,
++                          estore_residency_op, 1, &es->layers[il]);
++}
+diff --git a/src/llama-estore.h b/src/llama-estore.h
+new file mode 100644
+index 000000000..2ee39a7af
+--- /dev/null
++++ b/src/llama-estore.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++// Flash-streamed MoE experts (frontier-model runtime/estore).
++//
++// Enabled at runtime by FM_ESTORE_PACK=<expert pack> (index at <pack>.idx,
++// or FM_ESTORE_INDEX), with FM_ESTORE_POOL_GB (default 7) and FM_ESTORE_QD
++// (default 16), FM_ESTORE_POLICY (layer, the default, or lru), FM_ESTORE_PREFETCH_QD (prefetch reads in flight, default 2; demand
++// reads never queue behind more), optional FM_ESTORE_PRED (prefetch predictors) and FM_ESTORE_STATS
++// (print cache stats at exit), FM_ESTORE_VK=<vulkan device index> (import the pools into
++// Vulkan through their dma-bufs, so expert matmuls run on the GPU, zero-copy). When enabled, build_moe_ffn routes the expert matmuls
++// through per-group slot pools: a CPU op maps the router's expert ids to
++// pool slots, fetching misses from flash, and the MUL_MAT_IDs read the pools.
++// The model's own *_exps tensors are never touched (keep them mmapped on
++// the CPU, e.g. -ot exps=CPU, so they cost no RAM).
++
++#include "ggml.h"
++
++struct llama_estore;
++
++// the process-wide store, or nullptr when FM_ESTORE_PACK is unset
++llama_estore * llama_estore_get(int n_layer);
++
++// pool tensor standing in for model tensor `exps` (up/gate/down) of layer il. With FM_ESTORE_SPLIT the pools
++// have a CPU view and a Vulkan view of the same memory; gpu selects the Vulkan one
++ggml_tensor * llama_estore_pool(llama_estore * es, int il, const char * proj, const ggml_tensor * exps, bool gpu = false);
++
++// FM_ESTORE_SPLIT=k: run the first k of each token's experts on the GPU and the rest on the CPU, at the
++// same time (0 = off)
++int llama_estore_split_gpu(const llama_estore * es);
++// is (il, expert) resident or loading in the expert cache (no I/O)? For cache-aware routing (FM_CACHE_ROUTE)
++bool llama_estore_resident(llama_estore * es, int il, int expert);
++
++// CPU op: expert ids [n_used, n_tokens] -> slot ids, fetching misses. h is the
++// router input (f32 [n_embd, n_tokens]); at layers with a prefetch predictor
++// (FM_ESTORE_PRED=<train.py --export dir>, at most FM_ESTORE_PRED_M experts per layer
++// with probability > FM_ESTORE_PRED_P; or FM_ESTORE_PRED_INT8=<tools/tpu/make_predictors.py dir>,
++// the int8 TPU predictors run on the CPU with the TPU's arithmetic; add FM_ESTORE_PRED_TPU=1 to run
++// them on the Edge TPU through finch, async unless FM_ESTORE_TPU_SYNC=1)
++// decode steps use it to prefetch the next layers' experts.
++ggml_tensor * llama_estore_residency(llama_estore * es, ggml_context * ctx, ggml_tensor * ids, ggml_tensor * h, int il);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index a806126ef..a8a76755b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,5 +1,9 @@
+ #include "llama-graph.h"
+ 
++#ifdef LLAMA_FM_ESTORE
++#include "llama-estore.h"
++#endif
++
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-batch.h"
+@@ -16,6 +20,7 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -23,6 +28,155 @@
+ #include <sstream>
+ #include <string>
+ #include <unordered_set>
++#include <vector>
++
++// FM_CACHE_ROUTE=<gamma>: cache-aware expert routing. Before top-k, the selection score of every expert
++// already in the expert cache is multiplied by (1 + gamma), so a cached expert displaces an uncached one
++// whose router probability is less than (1 + gamma) times its own. The expert weights still come from the
++// unbiased probabilities. With the expert store (FM_ESTORE_PACK) the cache is the store itself: resident
++// and in-flight experts, including prefetches. Otherwise, or with FM_CACHE_ROUTE_SLOTS=n, it is simulated
++// per layer (n slots, default 9: an LRU over the layer's own history, as estore's LAYER policy keeps it),
++// walking the batch's tokens in order, so a batched evaluation sees the cache state that token-by-token
++// decode would. gamma 0 only counts misses.
++// FM_CACHE_SKIP=<tau> (with FM_CACHE_ROUTE): a chosen expert that is not cached and holds less than tau of the
++// chosen experts' router mass is replaced by the best cached expert not already chosen, and that stand-in's
++// weight is zeroed before normalisation: the token runs on the remaining experts and the flash read is skipped.
++struct fm_cache_route_layer {
++    std::vector<int> lru;   // resident experts, least recent first
++    std::vector<char> zero; // [n_tokens, n_expert] of the current batch: stand-ins whose weight is zeroed
++    long tokens = 0, misses = 0, swaps = 0, skips = 0;
++    double mass_top = 0, mass_kept = 0;   // router mass of the plain top-k vs of the chosen experts
++};
++
++static struct fm_cache_route_state {
++    float gamma = -1.0f;
++    float skip  = -1.0f;
++    int   slots = 9;
++    bool  live  = false;   // ask the expert store
++#ifdef LLAMA_FM_ESTORE
++    llama_estore * es = nullptr;
++#endif
++    std::vector<fm_cache_route_layer> layers;
++    ~fm_cache_route_state() {
++        long t = 0, m = 0, s = 0, sk = 0;
++        double top = 0, kept = 0;
++        for (const auto & l : layers) {
++            t = std::max(t, l.tokens); m += l.misses; s += l.swaps; sk += l.skips; top += l.mass_top; kept += l.mass_kept;
++        }
++        if (t > 0) {
++            fprintf(stderr, "fm-cache-route: gamma %.3f, skip %.3f, %d slots: %ld tokens, %.1f misses/token, %.2f swaps/token, "
++                    "%.2f skips/token, router mass kept %.4f\n", gamma, skip, live ? -1 : slots, t, (double) m / t,
++                    (double) s / t, (double) sk / t, top > 0 ? kept / top : 1.0);
++        }
++    }
++} fm_cache_route;
++
++static float fm_cache_route_gamma() {
++    static const float g = [] {
++        const char * e = getenv("FM_CACHE_ROUTE");
++        if (e && getenv("FM_CACHE_ROUTE_SLOTS")) {
++            fm_cache_route.slots = std::max(1, atoi(getenv("FM_CACHE_ROUTE_SLOTS")));
++        }
++        fm_cache_route.gamma = e ? (float) atof(e) : -1.0f;
++        fm_cache_route.skip  = e && getenv("FM_CACHE_SKIP") ? (float) atof(getenv("FM_CACHE_SKIP")) : -1.0f;
++#ifdef LLAMA_FM_ESTORE
++        if (e && !getenv("FM_CACHE_ROUTE_SLOTS") && getenv("FM_ESTORE_PACK")) {
++            fm_cache_route.live = true;
++        }
++#endif
++        return fm_cache_route.gamma;
++    }();
++    return g;
++}
++
++// map_custom1 op: dst = src scores with cached experts boosted; userdata = (layer index, n_expert_used)
++static void fm_cache_route_op(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void * ud) {
++    if (ith != 0) {
++        return;   // one pass in token order: each token sees the cache its predecessors left
++    }
++    (void) nth;
++    const int il = (int) (intptr_t) ud >> 8, k = (int) (intptr_t) ud & 0xff;
++    auto & L = fm_cache_route.layers[il];
++    const int n_expert = (int) src->ne[0];
++    const float boost = 1.0f + fm_cache_route.gamma;
++    std::vector<int> ord(n_expert), plain(n_expert);
++    std::vector<float> score(n_expert);
++    std::vector<char> cached(n_expert);
++    const bool skip = fm_cache_route.skip > 0.0f;
++    if (skip) {
++        L.zero.assign((size_t) src->ne[1] * n_expert, 0);
++    }
++    for (int64_t t = 0; t < src->ne[1]; ++t) {
++        const float * p = (const float *) ((const char *) src->data + t * src->nb[1]);
++        float * o = (float *) ((char *) dst->data + t * dst->nb[1]);
++        std::fill(cached.begin(), cached.end(), 0);
++#ifdef LLAMA_FM_ESTORE
++        if (fm_cache_route.live) {
++            for (int e = 0; e < n_expert; ++e) cached[e] = llama_estore_resident(fm_cache_route.es, il, e);
++        } else
++#endif
++        for (int e : L.lru) cached[e] = 1;
++        for (int e = 0; e < n_expert; ++e) {
++            score[e] = cached[e] ? p[e] * boost : p[e];
++            o[e] = score[e];
++            ord[e] = plain[e] = e;
++        }
++        std::partial_sort(ord.begin(), ord.begin() + k, ord.end(), [&](int a, int b) { return score[a] > score[b]; });
++        std::partial_sort(plain.begin(), plain.begin() + k, plain.end(), [&](int a, int b) { return p[a] > p[b]; });
++        if (skip) {
++            float mass = 0.0f;
++            for (int i = 0; i < k; ++i) mass += p[ord[i]];
++            // ord[k..) is unsorted: the stand-in is the best-scoring cached expert outside the chosen k
++            for (int i = k - 1; i >= 0; --i) {
++                const int e = ord[i];
++                if (cached[e] || p[e] >= fm_cache_route.skip * mass) continue;
++                int r = -1;
++                for (int j = k; j < n_expert; ++j) {
++                    if (cached[ord[j]] && (r < 0 || score[ord[j]] > score[ord[r]])) r = j;
++                }
++                if (r < 0) break;
++                std::swap(ord[i], ord[r]);
++                L.zero[(size_t) t * n_expert + ord[i]] = 1;
++                L.skips++;
++            }
++            // make the plain top-k over o[] pick exactly the chosen set, in score order
++            for (int i = 0; i < k; ++i) o[ord[i]] = 10.0f + score[ord[i]];
++        }
++        for (int i = 0; i < k; ++i) {
++            L.mass_top  += p[plain[i]];
++            if (!skip || !L.zero[(size_t) t * n_expert + ord[i]]) L.mass_kept += p[ord[i]];
++            const int e = ord[i];
++            if (std::find(plain.begin(), plain.begin() + k, e) == plain.begin() + k) L.swaps++;
++            if (!cached[e]) L.misses++;
++            if (fm_cache_route.live) continue;   // the store does its own bookkeeping
++            auto it = std::find(L.lru.begin(), L.lru.end(), e);
++            if (it != L.lru.end()) L.lru.erase(it);
++            L.lru.push_back(e);
++        }
++        while ((int) L.lru.size() > std::max(fm_cache_route.slots, k)) {
++            L.lru.erase(L.lru.begin());
++        }
++        L.tokens++;
++    }
++}
++
++// map_custom2 op (FM_CACHE_SKIP): dst = expert weights [1, n_used, n_tokens] with the stand-ins zeroed;
++// b = the selected experts [n_used, n_tokens]; userdata = layer index
++static void fm_cache_skip_op(ggml_tensor * dst, const ggml_tensor * w, const ggml_tensor * ids, int ith, int nth, void * ud) {
++    if (ith != 0) {
++        return;
++    }
++    (void) nth;
++    const auto & L = fm_cache_route.layers[(int) (intptr_t) ud];
++    const int64_t n_expert = L.zero.size() / std::max<int64_t>(1, w->ne[2]);
++    for (int64_t t = 0; t < w->ne[2]; ++t) {
++        for (int64_t i = 0; i < w->ne[1]; ++i) {
++            const float v = *(const float *) ((const char *) w->data + i * w->nb[1] + t * w->nb[2]);
++            const int e = *(const int32_t *) ((const char *) ids->data + i * ids->nb[0] + t * ids->nb[1]);
++            *(float *) ((char *) dst->data + i * dst->nb[1] + t * dst->nb[2]) = L.zero[t * n_expert + e] ? 0.0f : v;
++        }
++    }
++}
+ 
+ // dedup helpers
+ 
+@@ -2087,6 +2241,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(selection_probs, "ffn_moe_probs_biased", il);
+     }
+ 
++    if (fm_cache_route_gamma() >= 0.0f && hparams.n_expert_groups <= 1 && selected_experts_in == nullptr && n_tokens > 0) {
++        if ((int) fm_cache_route.layers.size() < (int) hparams.n_layer()) {
++            fm_cache_route.layers.resize(hparams.n_layer());
++#ifdef LLAMA_FM_ESTORE
++            fm_cache_route.es = llama_estore_get(hparams.n_layer());
++            fm_cache_route.live = fm_cache_route.live && fm_cache_route.es;
++#endif
++        }
++        selection_probs = ggml_map_custom1(ctx0, ggml_cont(ctx0, selection_probs), fm_cache_route_op, 1,
++                                           (void *) (intptr_t) ((il << 8) | (int) n_expert_used));
++        cb(selection_probs, "ffn_moe_probs_cache_route", il);
++    }
++
+     // select top n_group_used expert groups
+     // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
+     if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+@@ -2129,8 +2296,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+     }
+ 
++    // ids used by the expert matmuls: the experts themselves, or their slots in
++    // the flash-streaming pools (frontier-model estore)
++    ggml_tensor * mm_ids = selected_experts;
++    int split_k = 0;                                    // FM_ESTORE_SPLIT: experts per token on the GPU
++    ggml_tensor * up_g = nullptr, * gate_g = nullptr, * down_g = nullptr;
++#ifdef LLAMA_FM_ESTORE
++    if (llama_estore * es = llama_estore_get(hparams.n_layer())) {
++        GGML_ASSERT(!gate_up_exps && !up_exps_s && !gate_exps_s && !down_exps_s && "estore: unsupported expert layout");
++        mm_ids = llama_estore_residency(es, ctx0, selected_experts, cur, il);
++        cb(mm_ids, "ffn_moe_slots", il);
++        up_exps   = llama_estore_pool(es, il, "up", up_exps);
++        gate_exps = gate_exps ? llama_estore_pool(es, il, "gate", gate_exps) : nullptr;
++        down_exps = llama_estore_pool(es, il, "down", down_exps);
++        split_k = std::min<int>(llama_estore_split_gpu(es), (int) n_expert_used);
++        // only split batches of at least FM_ESTORE_SPLIT_MIN_TOKENS (default 32): at decode the per-layer CPU<->GPU
++        // handoff (~2 ms x 94 layers on the Fold) costs more than the GPU saves; prompts gain ~24%
++        static const int64_t split_min = getenv("FM_ESTORE_SPLIT_MIN_TOKENS") ? atoll(getenv("FM_ESTORE_SPLIT_MIN_TOKENS")) : 32;
++        if (n_tokens < split_min) {
++            split_k = 0;
++        }
++        if (split_k > 0) {
++            GGML_ASSERT(gate_exps && type_op == LLM_FFN_SILU && !weight_before_ffn && !up_exps_b && !gate_exps_b &&
++                        !down_exps_b && (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f) &&
++                        "FM_ESTORE_SPLIT: only the plain SwiGLU expert FFN is supported");
++            up_g   = llama_estore_pool(es, il, "up", up_exps, true);
++            gate_g = llama_estore_pool(es, il, "gate", gate_exps, true);
++            down_g = llama_estore_pool(es, il, "down", down_exps, true);
++        }
++    }
++#endif
++
+     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+     cb(weights, "ffn_moe_weights", il);
++    if (fm_cache_route_gamma() >= 0.0f && fm_cache_route.skip > 0.0f && hparams.n_expert_groups <= 1 && selected_experts_in == nullptr && n_tokens > 0) {
++        weights = ggml_map_custom2(ctx0, weights, selected_experts, fm_cache_skip_op, 1, (void *) (intptr_t) il);
++        cb(weights, "ffn_moe_weights_skip", il);
++    }
+ 
+ 
+     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+@@ -2172,9 +2374,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(cur, "ffn_moe_weighted", il);
+     }
+ 
+-    ggml_tensor * up = nullptr;
+     ggml_tensor * experts = nullptr;
+ 
++    if (split_k > 0) {
++        // FM_ESTORE_SPLIT: the first split_k experts of each token run on the GPU (Vulkan views of the estore
++        // pools), the rest on the CPU (CPU views of the same memory). The GPU chain is built first: Vulkan
++        // graph compute returns before the GPU finishes, so with FM_SCHED_OVERLAP the CPU chain runs at the
++        // same time. Everything the GPU chain reads is marked as output so the allocator never hands its
++        // memory to a CPU-chain tensor while the GPU may still be reading it.
++        auto expert_ffn = [&](ggml_tensor * u, ggml_tensor * g, ggml_tensor * d, ggml_tensor * ids) {
++            ggml_tensor * up_  = ggml_mul_mat_id(ctx0, u, cur, ids);
++            ggml_tensor * gate = ggml_mul_mat_id(ctx0, g, cur, ids);
++            return ggml_mul_mat_id(ctx0, d, ggml_swiglu_split(ctx0, gate, up_), ids);
++        };
++        const int64_t n_cpu = (int64_t) n_expert_used - split_k;
++        // the CPU chain's ids are built before the GPU chain and pinned to the CPU (llama-context): built after it,
++        // the scheduler expands the GPU assignment down onto this copy, and the CPU chain then waits for the GPU
++        ggml_tensor * ids_c = nullptr;
++        if (n_cpu > 0) {
++            ids_c = ggml_cont(ctx0, ggml_view_2d(ctx0, mm_ids, n_cpu, n_tokens, mm_ids->nb[1], split_k * ggml_element_size(mm_ids)));
++            cb(ids_c, "ffn_moe_ids_cpu", il);
++            ggml_build_forward_expand(gf, ids_c);
++        }
++        ggml_tensor * ids_g = split_k == (int) n_expert_used ? mm_ids :
++            ggml_cont(ctx0, ggml_view_2d(ctx0, mm_ids, split_k, n_tokens, mm_ids->nb[1], 0));
++        ggml_set_output(ids_g);
++        ggml_set_output(cur);
++        ggml_tensor * e_g = expert_ffn(up_g, gate_g, down_g, ids_g);
++        cb(e_g, "ffn_moe_down_gpu", il);
++        ggml_build_forward_expand(gf, e_g);
++        experts = e_g;
++        if (n_cpu > 0) {
++            ggml_tensor * e_c = expert_ffn(up_exps, gate_exps, down_exps, ids_c);
++            cb(e_c, "ffn_moe_down_cpu", il);
++            experts = ggml_concat(ctx0, e_g, e_c, 1);   // [n_embd, n_expert_used, n_tokens], router order kept
++            // the context pins this to the GPU: a CPU split that consumed e_g would wait for the GPU before it
++            // started, i.e. before the CPU expert chain could run
++            cb(experts, "ffn_moe_down_cat", il);
++        }
++        cb(experts, "ffn_moe_down", il);
++    }
++
++    if (!experts) {
++    ggml_tensor * up = nullptr;
++
+     if (gate_up_exps) {
+         // merged gate_up path: one mul_mat_id, then split into gate and up views
+         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+@@ -2196,7 +2439,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, mm_ids, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -2209,7 +2452,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, mm_ids, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2310,12 +2553,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range
+         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+     }
+     cb(experts, "ffn_moe_down", il);
++    } // !experts (not the FM_ESTORE_SPLIT path)
+ 
+     if (down_exps_s) {
+         cb(experts, "ffn_moe_down_scaled", il);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 43c396f15..883b1ca3c 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1339,7 +1339,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
+-    if (flags & TENSOR_READ_LAZY) {
++    // frontier-model estore: with FM_ESTORE_PACK the routed experts stream from the expert pack, so
++    // the model's own *_exps tensors are never read; mark them lazy so their ranges are not prefetched
++    const bool fm_estore_exps = getenv("FM_ESTORE_PACK") && tn.str().find("_exps") != std::string::npos;
++    if ((flags & TENSOR_READ_LAZY) || fm_estore_exps) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+     }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index a0f9f1142..01e0dae66 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -751,6 +751,7 @@ struct llama_model {
+     const float * tensor_split() const;
+ 
+     uint32_t n_gpu_layers() const;
++    bool     no_host() const { return params.no_host; }   // frontier-model: CPU buffers stay plain host memory
+     llama_split_mode split_mode() const;
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 32c3f3d2a..89303e7a7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11457,6 +11457,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // qwen3-235b-a22b Q3_K_M experts (frontier-model): gate/up [k 4096 -> m 1536] in Q3_K, down
++    // [k 1536 -> m 4096] in Q4_K (Q5_K in 5 layers); decode is bs 1, prefill ubatches are larger.
++    // UD-Q2_K_XL: gate/up Q2_K, down Q3_K (Q4_K in 15 layers)
++    for (int bs : {1, 16, 128}) {
++        for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 1536, bs, 4096));
++        }
++        for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 4096, bs, 1536));
++        }
++    }
++    // lower-bit candidates for the same expert shapes (smaller experts = fewer flash bytes per miss), decode only
++    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 1536, 1, 4096));
++    }
++    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 4096, 1, 1536));
++    }
++
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+             for (ggml_type type_b : {GGML_TYPE_F32}) {
